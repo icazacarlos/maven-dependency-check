@@ -1,0 +1,388 @@
+trigger: none
+
+pool:
+  name: AKS_Agents
+  demands:
+    - dependency.check -equals enabled
+
+resources:
+  repositories:
+  - repository: azure_shared_lib
+    type: git
+    name: BHDL-DevOps/_git/AzureSharedlib
+    ref: refs/heads/feature/416104
+  - repository: azure_templates
+    type: git
+    name: BHDL-DevOps/_git/azure_templates
+    ref: refs/heads/feature/416104
+
+parameters:
+  - name: package
+    displayName: Maven Coordinates (G:A:V)
+    type: string
+
+variables:
+  - name: tmp_package_coordinates
+    value: ${{ parameters.package }}
+  - name: package_coordinates
+    value: $[replace(variables['tmp_package_coordinates'],':','--')]
+
+name: "$(Date:yyyyMMdd)$(Rev:.r) - $(package_coordinates)"
+
+jobs:
+  - job: MavenDependencyScanner
+    displayName: Maven Dependency Scanner
+    workspace:
+      clean: all
+    variables:
+      key: "value"
+    steps:
+      - checkout: azure_templates
+        clean: true
+        fetchDepth: 1
+        fetchTags: 'false'
+        retryCountOnTaskFailure: 3
+        timeoutInMinutes: 2
+
+      - checkout: azure_shared_lib
+        clean: true
+        fetchDepth: 1
+        fetchTags: 'false'
+        retryCountOnTaskFailure: 3
+        timeoutInMinutes: 2
+
+      - task: Bash@3
+        displayName: Initialize
+        name: Initialize
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Initialize global variables and pipeline layout"
+
+            mkdir -p $(System.DefaultWorkingDirectory)/{bhd-dependency-checker,CodeAnalysisLogs,reports/logs,reports/dependency-check,reports/cyclonedx-sbom,reports/sarif}
+
+            PROJECT_DIR=$(System.DefaultWorkingDirectory)/bhd-dependency-checker
+            REPORT_DIR=$(System.DefaultWorkingDirectory)/reports
+            LOG_DIR=$REPORT_DIR/logs
+            ERROR_FILE=$LOG_DIR/error.log
+            touch $ERROR_FILE
+
+            PACKAGE_NAME=${{ parameters.package }}
+            PACKAGE_NAME=$(echo $PACKAGE_NAME| sed -e 's|pkg:maven/||' -e 's|/|:|g' -e 's|@|:|g')
+
+            GAV_ARRAY=($(echo $PACKAGE_NAME | tr ":" "\n" | sed 's/[^a-zA-Z0-9.-_]//g'))
+
+            BHD_GROUP_ID=${GAV_ARRAY[0]}
+            BHD_ARTIFACT_ID=${GAV_ARRAY[1]}
+            BHD_VERSION=${GAV_ARRAY[2]}
+
+            MAVEN_SETTINGS_FILE=$(System.DefaultWorkingDirectory)/AzureSharedlib/pipelineScript/devsecops/config/settings.xml
+            MAVEN_WRAPPER_VERSION=3.8.8
+
+            export JAVA_HOME=$JAVA_HOME_11_X64
+            JAVA_VERSION=$($JAVA_HOME/bin/java -version 2>&1 | awk -F '"' '/version/ {print $2}')
+
+            PACKAGE_URL=$(echo $PACKAGE_NAME | awk -F':' '{print "pkg:maven/"$1"/"$2"@"$3}')
+
+            SERVER_ENDPOINT=https://dummyjson.com/product/add
+
+            echo -e "\n======================================="
+            echo "Maven Dependency Scanner"
+            echo "======================================="
+            echo "Package URL:"
+            echo "  $PACKAGE_URL"
+            echo "Maven Coordinates:"
+            echo "  $PACKAGE_NAME"
+            echo "    groupId: $BHD_GROUP_ID"
+            echo "    artifactId: $BHD_ARTIFACT_ID"
+            echo "    version: $BHD_VERSION"
+            echo "======================================="
+            echo "Java"
+            echo "  version: $JAVA_VERSION"
+            echo "======================================="
+            echo "Maven"
+            echo "  local repository:"
+            echo "    location: /root/.m2/bhd-dependency-checker-repository"
+            echo "    size: "$(du -sh /root/.m2/bhd-dependency-checker-repository | awk -F " " '{print $1}')
+            echo "  settings file: $MAVEN_SETTINGS_FILE"
+            echo "  version: $MAVEN_WRAPPER_VERSION"
+            echo -e "=======================================\n"
+
+            echo "##vso[task.setvariable variable=SERVER_ENDPOINT;isOutput=true]$SERVER_ENDPOINT"
+            echo "##vso[task.setvariable variable=PACKAGE_NAME;isOutput=true]$PACKAGE_NAME"
+            echo "##vso[task.setvariable variable=PACKAGE_URL;isOutput=true]$PACKAGE_URL"
+            echo "##vso[task.setvariable variable=PROJECT_DIR;isOutput=true]$PROJECT_DIR"
+            echo "##vso[task.setvariable variable=REPORT_DIR;isOutput=true]$REPORT_DIR"
+            echo "##vso[task.setvariable variable=LOG_DIR;isOutput=true]$LOG_DIR"
+            echo "##vso[task.setvariable variable=BHD_GROUP_ID;isOutput=true]$BHD_GROUP_ID"
+            echo "##vso[task.setvariable variable=BHD_ARTIFACT_ID;isOutput=true]$BHD_ARTIFACT_ID"
+            echo "##vso[task.setvariable variable=BHD_VERSION;isOutput=true]$BHD_VERSION"
+            echo "##vso[task.setvariable variable=MAVEN_SETTINGS_FILE;isOutput=true]$MAVEN_SETTINGS_FILE"
+            echo "##vso[task.setvariable variable=MAVEN_WRAPPER_VERSION;isOutput=true]$MAVEN_WRAPPER_VERSION"
+
+      - task: Bash@3
+        displayName: Create Maven Project
+        name: CreateMavenProject
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Create Maven Project"
+
+            cd $(Initialize.PROJECT_DIR)
+
+            cp $(System.DefaultWorkingDirectory)/AzureSharedlib/pipelineScript/devsecops/templates/maven/*.xml .
+
+      - task: Bash@3
+        displayName: Install Maven Wrapper
+        name: InstallMavenWrapper
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Install Maven Wrapper $(Initialize.MAVEN_WRAPPER_VERSION)"
+
+            cd $(Initialize.PROJECT_DIR)
+
+            echo -e "\n======================================="
+            echo "Processing:"
+            echo " command: wrapper:wrapper"
+            echo -e "=======================================\n"
+
+            export JAVA_HOME=$JAVA_HOME_11_X64
+            mvn \
+              --batch-mode \
+              --file project-initializer.xml \
+              --quiet \
+              --settings $(Initialize.MAVEN_SETTINGS_FILE) \
+              -Dmaven=$(Initialize.MAVEN_WRAPPER_VERSION) \
+              wrapper:wrapper
+
+      - task: Bash@3
+        displayName: Download Maven Dependencies
+        name: DownloadMavenDependencies
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Download Maven Dependencies"
+
+            cd $(Initialize.PROJECT_DIR)
+
+            echo -e "\n======================================="
+            echo "Processing:"
+            echo " command: dependency:list"
+            echo -e "=======================================\n"
+
+            export JAVA_HOME=$JAVA_HOME_11_X64
+            sh ./mvnw \
+              --batch-mode \
+              --file pom-one-dependency.xml \
+              --no-transfer-progress \
+              --settings $(Initialize.MAVEN_SETTINGS_FILE) \
+              --threads 2C \
+              -DBHD_GROUP_ID=$(Initialize.BHD_GROUP_ID) \
+              -DBHD_ARTIFACT_ID=$(Initialize.BHD_ARTIFACT_ID) \
+              -DBHD_VERSION=$(Initialize.BHD_VERSION) \
+              -DexcludeGroupIds=com.bhdleon,com.bhd \
+              dependency:list |& tee $(Initialize.LOG_DIR)/dependency_list.log
+
+            EXIT_CODE=${PIPESTATUS[0]}
+
+            if [ $EXIT_CODE == 0 ]
+            then
+              echo "ok: processing $(Initialize.PACKAGE_NAME)"
+            else
+              echo "ERROR: processing $(Initialize.PACKAGE_NAME)" |& tee -a $ERROR_FILE
+            fi
+
+      - task: Bash@3
+        displayName: Check for Newer Dependency Versions
+        name: CheckNewerDependencyVersions
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -o pipefail
+
+            echo "Check for Newer Dependency Versions"
+
+            cd $(Initialize.PROJECT_DIR)
+
+            echo -e "\n======================================="
+            echo "Processing:"
+            echo " command: versions:display-dependency-updates"
+            echo -e "=======================================\n"
+
+            export JAVA_HOME=$JAVA_HOME_11_X64
+            sh ./mvnw \
+              --batch-mode \
+              --no-transfer-progress \
+              --file pom-one-dependency.xml \
+              --settings $(Initialize.MAVEN_SETTINGS_FILE) \
+              -DBHD_GROUP_ID=$(Initialize.BHD_GROUP_ID) \
+              -DBHD_ARTIFACT_ID=$(Initialize.BHD_ARTIFACT_ID) \
+              -DBHD_VERSION=$(Initialize.BHD_VERSION) \
+              versions:display-dependency-updates |& tee $(Initialize.LOG_DIR)/dependency_list_new_versions.log
+
+            EXIT_CODE=${PIPESTATUS[0]}
+
+            if [ $EXIT_CODE == 0 ]
+            then
+              echo "ok: processing $(Initialize.PACKAGE_NAME)"
+            else
+              echo "ERROR: processing $(Initialize.PACKAGE_NAME)" |& tee -a $ERROR_FILE
+            fi
+
+      - task: Bash@3
+        displayName: Run Dependency Check
+        name: RunDependencyCheck
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Run Dependency Check Maven Plugin"
+
+            cd $(Initialize.PROJECT_DIR)
+
+            echo -e "\n======================================="
+            echo "Processing:"
+            echo " command: dependency-check:check"
+            echo -e "=======================================\n"
+
+            export JAVA_HOME=$JAVA_HOME_11_X64
+            sh ./mvnw \
+              --batch-mode \
+              --file pom-one-dependency.xml \
+              --no-transfer-progress \
+              --settings $(Initialize.MAVEN_SETTINGS_FILE) \
+              -DBHD_GROUP_ID=$(Initialize.BHD_GROUP_ID) \
+              -DBHD_ARTIFACT_ID=$(Initialize.BHD_ARTIFACT_ID) \
+              -DBHD_VERSION=$(Initialize.BHD_VERSION) \
+              dependency-check:check
+
+            EXIT_CODE=$?
+
+            if [ $EXIT_CODE == 0 ]
+            then
+              echo "ok: processing $(Initialize.PACKAGE_NAME)"
+            else
+              echo "ERROR: processing $(Initialize.PACKAGE_NAME)" |& tee -a $ERROR_FILE
+            fi
+
+      - task: Bash@3
+        displayName: Run CycloneDX
+        name: RunCycloneDX
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Run CycloneDX Maven Plugin"
+
+            cd $(Initialize.PROJECT_DIR)
+
+            echo -e "\n======================================="
+            echo "Processing:"
+            echo " command: cyclonedx:makeAggregateBom"
+            echo -e "=======================================\n"
+
+            export JAVA_HOME=$JAVA_HOME_11_X64
+            sh ./mvnw \
+              --batch-mode \
+              --file pom-one-dependency.xml \
+              --no-transfer-progress \
+              --settings $(Initialize.MAVEN_SETTINGS_FILE) \
+              -DBHD_GROUP_ID=$(Initialize.BHD_GROUP_ID) \
+              -DBHD_ARTIFACT_ID=$(Initialize.BHD_ARTIFACT_ID) \
+              -DBHD_VERSION=$(Initialize.BHD_VERSION) \
+              cyclonedx:makeAggregateBom
+
+            EXIT_CODE=$?
+
+            if [ $EXIT_CODE == 0 ]
+            then
+              echo "ok: processing $(Initialize.PACKAGE_NAME)"
+            else
+              echo "ERROR: processing $(Initialize.PACKAGE_NAME)" |& tee -a $ERROR_FILE
+            fi
+
+      - task: Bash@3
+        displayName: Prepare Reports
+        name: PrepareReports
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Prepare Reports"
+
+            cd $(Initialize.PROJECT_DIR)/target/
+
+            cp dependency-check* $(Initialize.REPORT_DIR)/dependency-check/
+            rm $(Initialize.REPORT_DIR)/dependency-check/*.sarif
+            cp bom* $(Initialize.REPORT_DIR)/cyclonedx-sbom/
+            cp *.sarif $(Initialize.REPORT_DIR)/sarif/
+            cp *.sarif $(System.DefaultWorkingDirectory)/CodeAnalysisLogs/
+
+      - task: PublishPipelineArtifact@1
+        displayName: Upload Vulnerability Reports
+        inputs:
+          artifactName: Vulnerability Reports
+          targetPath: $(System.DefaultWorkingDirectory)/reports
+
+      - task: PublishTestResults@2
+        displayName: Publish Vulnerability Results
+        inputs:
+          testResultsFiles: $(Initialize.PROJECT_DIR)/target/dependency-check-junit.xml
+          mergeTestResults: true
+          testRunTitle: 'Vulnerability Scanner Report'
+
+      - task: Bash@3
+        displayName: Register Scanner Results
+        name: RegisterScannerResults
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -o pipefail
+
+            cd $(Initialize.PROJECT_DIR)
+
+            echo "Register Scanner Results"
+            echo "Parse JSON and SARIF"
+            echo "call REST API with JSON payload"
+            echo "Process HTTP Response Code"
+            echo "AGENT_JOBSTATUS = $AGENT_JOBSTATUS"
+            echo "SYSTEM_JOBID = $SYSTEM_JOBID"
+            echo "BUILD_BUILDID = $BUILD_BUILDID"
+            echo "BUILD_SOURCEBRANCH = $BUILD_SOURCEBRANCH"
+            echo "BUILD_SOURCEVERSION = $BUILD_SOURCEVERSION"
+
+            curl \
+              --data "@$(System.DefaultWorkingDirectory)/AzureSharedlib/pipelineScript/devsecops/templates/api/api_rest_body.json" \
+              --header "Content-Type: application/json" \
+              --insecure \
+              --retry 4 \
+              --retry-delay 15 \
+              --retry-max-time 120 \
+              --silent \
+              --trace-ascii request.trace.log \
+              --write-out "AZ_HTTP_RESPONSE_STATUS_CODE:%{http_code}" \
+              $(Initialize.SERVER_ENDPOINT) \
+              |& tee api.response.txt
+            
+            EXIT_CODE=${PIPESTATUS[0]}
+            # EXIT_CODE == 0 -> OK
+
+            HTTP_STATUS=$(cat api.response.txt | tr -d '\n' | sed -e 's/.*AZ_HTTP_RESPONSE_STATUS_CODE://')
+
+            sed -i 's/AZ_HTTP_RESPONSE_STATUS_CODE:.*//g' api.response.txt
+
+            jq . api.response.txt
+
+            if [ ! $HTTP_STATUS -eq 200  ]; then
+              echo "Unable to fetch $SERVER_ENDPOINT"
+              echo "Error [HTTP status: $HTTP_STATUS]"
+            else
+              echo "Connection established with $SERVER_ENDPOINT"
+            fi
+        condition: always()
+
+      - task: Bash@3
+        displayName: Cleanup
+        inputs:
+          targetType: 'inline'
+          script: |
+            printenv | sort
+        condition: always()
